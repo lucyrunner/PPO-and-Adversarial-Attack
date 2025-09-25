@@ -3,7 +3,7 @@ from __future__ import annotations
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[1]:
+# In[55]:
 
 
 # One-cell train + save + smoke-check for ACCEnv + PPO (robust reset/step handling)
@@ -160,7 +160,7 @@ print(" -", vec_path)
 print("These artifacts will be loaded by your attacks notebook.")
 
 
-# In[2]:
+# In[56]:
 
 
 # === Make model/env ready for the demo ===
@@ -185,7 +185,7 @@ except ModuleNotFoundError:
         # ACCEnv should now be in globals
 
 
-# In[3]:
+# In[57]:
 
 
 # 2) Try to load saved PPO + VecNormalize; otherwise quick-train a small model
@@ -235,7 +235,7 @@ else:
 print("\n✅ model and env are ready in this kernel.")
 
 
-# In[4]:
+# In[58]:
 
 
 import gymnasium as gym
@@ -244,14 +244,14 @@ import numpy as np
 from typing import Any
 
 
-# In[5]:
+# In[59]:
 
 
 def _to_tensor(x: np.ndarray) -> torch.Tensor:
     return torch.as_tensor(x, dtype=torch.float32)
 
 
-# In[6]:
+# In[60]:
 
 
 class AttackWrapper:
@@ -273,7 +273,7 @@ class AttackWrapper:
         return action, obs_adv
 
 
-# In[7]:
+# In[61]:
 
 
 class FGSMAttack(AttackWrapper):
@@ -306,7 +306,7 @@ class FGSMAttack(AttackWrapper):
         return adv_np[0] if single else adv_np
 
 
-# In[8]:
+# In[62]:
 
 
 class OIAttack(AttackWrapper):
@@ -336,7 +336,7 @@ class OIAttack(AttackWrapper):
         return adv_np[0] if single else adv_np
 
 
-# In[9]:
+# In[63]:
 
 
 def print_attack_sanity(model, env, eps=0.01):
@@ -356,8 +356,129 @@ def print_attack_sanity(model, env, eps=0.01):
     print(" max |Δ|     :", float(np.max(np.abs(np.array(adv2) - np.array(obs)))))
 
 
-# In[10]:
+# In[64]:
 
 
 print_attack_sanity(model, env, eps=0.02)
+
+
+# In[65]:
+
+
+# Requires: a loaded PPO `model` bound to an ACCEnv(normalize_obs=True) `env`
+try:
+    obs = env.reset()[0] if isinstance(env.reset(), tuple) else env.reset()
+except Exception:
+    print("Load/define `model` and `env` (ACCEnv with normalize_obs=True) first.")
+else:
+    fgsm = FGSMAttack(model, epsilon=0.01)
+    oia  = OIAttack(model,  epsilon=0.02)
+
+    adv_f = fgsm.perturb(obs)
+    adv_o = oia.perturb(obs)
+
+    print("FGSM max |Δ|:", float(np.max(np.abs(adv_f - obs))))
+    print("OIA  max |Δ|:", float(np.max(np.abs(adv_o - obs))))
+
+    # If you want to see an actual collision tendency right here:
+    env.unwrapped.set_safety_obs_for_filter(adv_o)  # make safety use attacked obs
+    a_o, _ = model.predict(adv_o, deterministic=True)
+    _, _, term, trunc, info = env.step(a_o)
+    print("Step under OIA attacked obs — collision flag:", (info[0] if isinstance(info, list) else info).get("collision"))
+
+
+
+# In[66]:
+
+
+import torch
+import numpy as np
+import gymnasium as gym
+
+class AttackWrapper(gym.Wrapper):
+    def __init__(self, env, model, epsilon=0.01):
+        super(AttackWrapper, self).__init__(env)
+        self.model = model
+        self.epsilon = epsilon
+        self.attack_name = "BaseAttack"
+        
+    def step(self, action):
+        return self.env.step(action)
+    
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+class FGSMAttackWrapper(AttackWrapper):
+    def __init__(self, env, model, epsilon=0.01):
+        super(FGSMAttackWrapper, self).__init__(env, model, epsilon)
+        self.attack_name = "FGSM"
+        
+    def step(self, action):
+        # Get current state for gradient computation
+        norm_state = self.env._get_obs()
+        
+        # Convert to tensor for gradient computation
+        state_tensor = torch.tensor(norm_state, dtype=torch.float32, requires_grad=True)
+        
+        # Compute gradient of action with respect to state
+        action_tensor, _ = self.model.policy(state_tensor.unsqueeze(0))
+        action_tensor.mean().backward()
+        
+        if state_tensor.grad is not None:
+            gradient = state_tensor.grad.numpy()
+            perturbation = self.epsilon * np.sign(gradient)
+            
+            # Apply perturbation to normalized state
+            perturbed_norm_state = norm_state + perturbation
+            perturbed_norm_state = np.clip(perturbed_norm_state, 0, 1)
+            
+            # Store perturbed state for observation
+            self.env.last_perturbed_state = perturbed_norm_state
+        else:
+            self.env.last_perturbed_state = norm_state
+            
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs, reward, terminated, truncated, info
+    
+    def reset(self, **kwargs):
+        self.env.last_perturbed_state = None
+        obs, info = self.env.reset(**kwargs)
+        return obs, info
+
+class OLAttackWrapper(AttackWrapper):
+    def __init__(self, env, model, epsilon=0.01):
+        super(OLAttackWrapper, self).__init__(env, model, epsilon)
+        self.attack_name = "OIA"
+        
+    def step(self, action):
+        # Get current state for gradient computation
+        norm_state = self.env._get_obs()
+        
+        # Convert to tensor for gradient computation
+        state_tensor = torch.tensor(norm_state, dtype=torch.float32, requires_grad=True)
+        
+        # Compute gradient of value function with respect to state
+        value = self.model.policy.value_net(state_tensor.unsqueeze(0))
+        value.backward()
+        
+        if state_tensor.grad is not None:
+            gradient = state_tensor.grad.numpy()
+            perturbation = self.epsilon * np.sign(gradient)
+            
+            # Apply perturbation to normalized state
+            perturbed_norm_state = norm_state + perturbation
+            perturbed_norm_state = np.clip(perturbed_norm_state, 0, 1)
+            
+            # Store perturbed state for observation
+            self.env.last_perturbed_state = perturbed_norm_state
+        else:
+            self.env.last_perturbed_state = norm_state
+            
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs, reward, terminated, truncated, info
+    
+    def reset(self, **kwargs):
+        self.env.last_perturbed_state = None
+        obs, info = self.env.reset(**kwargs)
+        return obs, info
 

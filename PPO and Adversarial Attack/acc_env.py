@@ -1,196 +1,250 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# In[23]:
 
 
-from __future__ import annotations
-import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+import numpy as np
+import matplotlib.pyplot as plt
 
 class ACCEnv(gym.Env):
-    """
-    1D ACC environment with simple kinematics and a headway-based safety filter.
-
-    Observation s = [Δx, Δv, v]  (raw units: m, m/s, m/s)
-    Action a = acceleration in m/s^2 (continuous).
-
-    Normalization:
-      - If normalize_obs=True, env outputs normalized obs in [-1, 1] using fixed ranges.
-      - Attack budgets (epsilon) should be defined in normalized space.
-    """
-    metadata = {"render.modes": []}
-
-    def __init__(
-        self,
-        dt: float = 0.1,
-        v_ref: float = 15.0,
-        a_min: float = -3.5,
-        a_max: float = 2.0,
-        Th: float = 1.5,
-        d0: float = 5.0,
-        w_v: float = 0.5,
-        w_s: float = 2.0,
-        w_a: float = 0.01,
-        lead_v0: float = 15.0,
-        brake_profile: bool = False,
-        brake_start_s: float = 5.0,
-        brake_dur_s: float = 3.0,
-        lead_decel: float = -2.0,
-        episode_seconds: float = 20.0,
-        seed: int | None = None,
-        normalize_obs: bool = True,
-        obs_clip: float = 1.0,
-    ) -> None:
-        super().__init__()
+    def __init__(self, dt=0.1, max_steps=500):
+        super(ACCEnv, self).__init__()
+        
+        # Parameters from the paper
         self.dt = dt
-        self.v_ref = v_ref
-        self.a_min = a_min
-        self.a_max = a_max
-        self.Th = Th
-        self.d0 = d0
-        self.w_v = w_v
-        self.w_s = w_s
-        self.w_a = w_a
-        self.lead_v0 = lead_v0
-        self.brake_profile = brake_profile
-        self.brake_start_s = brake_start_s
-        self.brake_dur_s = brake_dur_s
-        self.lead_decel = lead_decel
-        self.episode_steps = int(episode_seconds / dt)
-        self.normalize_obs = normalize_obs
-        self.obs_clip = obs_clip
-
-        self.np_random, _ = gym.utils.seeding.np_random(seed)
-
-        # Observation space (normalized if normalize_obs=True)
-        high = np.array([1.0, 1.0, 1.0], dtype=np.float32) if normalize_obs else np.array([np.inf, np.inf, np.inf], dtype=np.float32)
-        self.observation_space = spaces.Box(low=-high, high=high, dtype=np.float32)
-
-        # Action space in raw units (m/s^2)
+        self.max_steps = max_steps
+        self.current_step = 0
+        
+        # Vehicle parameters
+        self.ego_pos = 0.0
+        self.ego_vel = 5.0  # Initial speed as in paper
+        self.lead_vel = 15.0  # Constant lead speed during training
+        self.lead_pos = 20.0  # Initial lead position
+        
+        # Acceleration limits
+        self.max_accel = 2.0
+        self.max_decel = -3.5
+        
+        # Safety parameters
+        self.T_h = 1.5  # Time headway
+        self.d0 = 5.0   # Standstill distance
+        
+        # Target speed
+        self.v_ref = 15.0
+        self.v_min = 10.0
+        self.v_max = 20.0
+        
+        # Action space: continuous acceleration
         self.action_space = spaces.Box(
-            low=np.array([self.a_min], dtype=np.float32),
-            high=np.array([self.a_max], dtype=np.float32),
-            dtype=np.float32,
+            low=np.array([self.max_decel], dtype=np.float32), 
+            high=np.array([self.max_accel], dtype=np.float32), 
+            shape=(1,), 
+            dtype=np.float32
         )
-
-        # Normalization ranges for obs (hand-tuned for ACC task)
-        # Δx in [0, 200] m -> map to [-1, 1]
-        # Δv in [-20, 20] m/s -> map to [-1, 1]
-        # v in [0, 30] m/s -> map to [-1, 1]
-        self._x_range = (0.0, 200.0)
-        self._dv_range = (-20.0, 20.0)
-        self._v_range = (0.0, 30.0)
-
-        self.reset()
-
-    # ---------- Normalization helpers ----------
-    def _norm(self, s_raw: np.ndarray) -> np.ndarray:
-        Δx, Δv, v = s_raw
-        def _scale(val, lo, hi):
-            # map [lo,hi] -> [-1,1]
-            val = (val - lo) / (hi - lo + 1e-8)
-            return np.clip(2.0*val - 1.0, -self.obs_clip, self.obs_clip)
-        return np.array([
-            _scale(Δx, *self._x_range),
-            _scale(Δv, *self._dv_range),
-            _scale(v, *self._v_range),
-        ], dtype=np.float32)
-
-    def _denorm(self, s_norm: np.ndarray) -> np.ndarray:
-        # Map [-1,1] back to raw
-        def _inv(vn, lo, hi):
-            x = (vn + 1.0) * 0.5 * (hi - lo) + lo
-            return x
-        Δx = _inv(s_norm[0], *self._x_range)
-        Δv = _inv(s_norm[1], *self._dv_range)
-        v  = _inv(s_norm[2], *self._v_range)
-        return np.array([Δx, Δv, v], dtype=np.float32)
-
-    # ---------- Safety filter ----------
-    def _amax_safe(self, Δx: float, Δv: float, v: float) -> float:
-        # Eq.(5): a_max_safe = (Δx - Th*v + Δv*dt) / (Th*dt)
-        return (Δx - self.Th * v + Δv * self.dt) / (self.Th * self.dt + 1e-8)
-
-    def _apply_safety(self, a_rl: float, Δx: float, Δv: float, v: float) -> float:
-        a_safe_max = self._amax_safe(Δx, Δv, v)
-        a_clamped = min(a_rl, a_safe_max)
-        return float(np.clip(a_clamped, self.a_min, self.a_max))
-
-    # ---------- Gym API ----------
-    def reset(self, *, seed: int | None = None, options=None):
+        
+        # State space: [relative_distance, relative_velocity, ego_velocity, iteration_count]
+        self.observation_space = spaces.Box(
+            low=np.array([0, -10, 0, 0], dtype=np.float32), 
+            high=np.array([100, 10, 30, max_steps], dtype=np.float32), 
+            shape=(4,),
+            dtype=np.float32
+        )
+        
+        # For testing scenarios
+        self.test_mode = False
+        self.brake_start_time = None
+        self.brake_duration = 3.0
+        self.lead_decel = -2.0
+        
+        # For rendering
+        self.fig = None
+        self.axs = None
+        
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 0
+        self.ego_pos = 0.0
+        self.ego_vel = 5.0  # Non-zero initial speed as in paper
+        
+        # Randomize lead vehicle initial conditions for diversity
         if seed is not None:
-            self.np_random, _ = gym.utils.seeding.np_random(seed)
-        # Ego starts behind lead with ~30-50 m headway and near target speed with small noise
-        self.x_e = 0.0
-        self.v_e = float(np.clip(self.v_ref + self.np_random.normal(0, 0.5), 0.0, self._v_range[1]))
-        self.a_prev = 0.0
-
-        self.x_l = float(self.np_random.uniform(30.0, 50.0))
-        self.v_l = self.lead_v0
-        self._t = 0
-        self._collision = False
-
-        obs = self._get_obs()
-        info = {}
-        return obs, info
-
-    def _lead_step(self):
-        t = self._t * self.dt
-        if self.brake_profile and (t >= self.brake_start_s) and (t < self.brake_start_s + self.brake_dur_s):
-            self.v_l = max(self.v_l + self.lead_decel * self.dt, 0.0)
-        # else constant
-
-        self.x_l = self.x_l + self.v_l * self.dt
-
-    def _get_obs(self) -> np.ndarray:
-        Δx = self.x_l - self.x_e
-        Δv = self.v_l - self.v_e
-        s_raw = np.array([Δx, Δv, self.v_e], dtype=np.float32)
-        if self.normalize_obs:
-            return self._norm(s_raw)
-        return s_raw
-
-    def _reward(self) -> float:
-        Δx = self.x_l - self.x_e
-        Δv = self.v_l - self.v_e
-        v  = self.v_e
-        d_safe = self.d0 + self.Th * v
-        r_speed = - self.w_v * (v - self.v_ref)**2
-        r_safe  = - self.w_s * max(0.0, d_safe - Δx)**2
-        r_act   = - self.w_a * (self.a_prev**2)
-        return float(r_speed + r_safe + r_act)
-
+            np.random.seed(seed)
+        self.lead_pos = np.random.uniform(15, 25)
+        self.lead_vel = np.random.uniform(12, 18)
+        
+        if self.test_mode:
+            self.lead_vel = 15.0  # Fixed for consistent testing
+            self.lead_pos = 20.0
+            self.brake_start_time = 100  # Start braking at step 100
+        
+        return self._get_obs(), {}
+    
+    def _get_obs(self):
+        """Get normalized observation as described in paper"""
+        rel_dist = self.lead_pos - self.ego_pos
+        rel_vel = self.lead_vel - self.ego_vel
+        
+        # Normalize state to [0, 1] range for stable training
+        norm_rel_dist = rel_dist / 100.0
+        norm_rel_vel = (rel_vel + 10) / 20.0  # Map [-10, 10] to [0, 1]
+        norm_ego_vel = self.ego_vel / 30.0
+        norm_step = self.current_step / self.max_steps
+        
+        return np.array([norm_rel_dist, norm_rel_vel, norm_ego_vel, norm_step], dtype=np.float32)
+    
+    def _get_denormalized_state(self):
+        """Get actual physical state values"""
+        rel_dist = self.lead_pos - self.ego_pos
+        rel_vel = self.lead_vel - self.ego_vel
+        return np.array([rel_dist, rel_vel, self.ego_vel, self.current_step])
+    
     def step(self, action):
-        a_rl = float(np.clip(action, self.a_min, self.a_max)[0])
-        # Convert (possibly normalized obs) to raw for safety filter
-        s = self._get_obs()
-        if self.normalize_obs:
-            s_raw = self._denorm(s)
+        action = np.clip(action, self.max_decel, self.max_accel)[0]
+        
+        # Apply safety filter (CBF)
+        safe_action = self._safety_filter(action)
+        
+        # Update ego vehicle
+        self.ego_vel += safe_action * self.dt
+        self.ego_vel = np.clip(self.ego_vel, 0, 30)  # Physical limits
+        self.ego_pos += self.ego_vel * self.dt
+        
+        # Update lead vehicle
+        if self.test_mode and self.brake_start_time is not None:
+            if self.current_step >= self.brake_start_time and \
+               self.current_step < self.brake_start_time + self.brake_duration/self.dt:
+                self.lead_vel = max(0, self.lead_vel + self.lead_decel * self.dt)
+            elif self.current_step >= self.brake_start_time + self.brake_duration/self.dt:
+                self.lead_vel = max(0, 15.0 + self.lead_decel * self.brake_duration)  # New speed
+        
+        self.lead_pos += self.lead_vel * self.dt
+        
+        # Calculate reward
+        reward = self._calculate_reward(safe_action)
+        
+        # Check termination conditions
+        terminated = False
+        truncated = False
+        collision = (self.lead_pos - self.ego_pos) <= 0
+        timeout = self.current_step >= self.max_steps
+        reached_end = self.ego_pos >= 1000  # Arbitrary road length
+        
+        if collision:
+            reward -= 50  # Large penalty for collision
+            terminated = True
+        elif reached_end:
+            reward += 50  # Large reward for completing episode
+            terminated = True
+        elif timeout:
+            truncated = True
+            
+        self.current_step += 1
+        
+        return self._get_obs(), reward, terminated, truncated, {
+            'collision': collision,
+            'safe_action': safe_action,
+            'original_action': action
+        }
+    
+    def _calculate_reward(self, action):
+        """Calculate reward according to paper's formulation"""
+        rel_dist = self.lead_pos - self.ego_pos
+        
+        # Step penalty (encourage faster completion)
+        r_step = -0.05
+        
+        # Speed reward (piecewise linear as in paper)
+        if self.ego_vel < self.v_min:
+            r_speed = -0.1 * (self.v_min - self.ego_vel)
+        elif self.ego_vel > self.v_max:
+            r_speed = -0.1 * (self.ego_vel - self.v_max)
         else:
-            s_raw = s
-        Δx, Δv, v = float(s_raw[0]), float(s_raw[1]), float(s_raw[2])
-
-        a = self._apply_safety(a_rl, Δx, Δv, v)
-
-        # Ego dynamics
-        self.x_e = self.x_e + self.v_e * self.dt
-        self.v_e = max(self.v_e + a * self.dt, 0.0)
-        self.a_prev = a
-
-        # Lead dynamics
-        self._lead_step()
-
-        # Check collision
-        if (self.x_l - self.x_e) <= 0.0:
-            self._collision = True
-
-        obs = self._get_obs()
-        reward = self._reward()
-        self._t += 1
-        terminated = self._collision
-        truncated = self._t >= self.episode_steps
-        info = {"collision": self._collision, "a": a, "v": self.v_e, "Δx": self.x_l - self.x_e}
-        return obs, reward, terminated, truncated, info
+            r_speed = 0.1 * (self.ego_vel - self.v_min)
+        
+        # Safety distance penalty
+        safe_dist = self.d0 + self.T_h * self.ego_vel
+        if rel_dist < safe_dist:
+            r_safe = -2.0 * (safe_dist - rel_dist) ** 2
+        else:
+            r_safe = 0.0
+            
+        # Action penalty (for comfort)
+        r_action = -0.01 * (action ** 2)
+        
+        # Idling penalty (if standing still for too long)
+        r_idling = -20.0 if self.ego_vel < 0.1 and self.current_step > 10 else 0.0
+        
+        total_reward = r_step + r_speed + r_safe + r_action + r_idling
+        return total_reward
+    
+    def _safety_filter(self, action):
+        """CBF safety filter implementation"""
+        rel_dist = self.lead_pos - self.ego_pos
+        rel_vel = self.lead_vel - self.ego_vel
+        
+        # Calculate maximum safe acceleration using CBF constraint
+        # Simplified version assuming lead acceleration = 0
+        h = rel_dist - self.T_h * self.ego_vel
+        
+        if h < 0:  # Already unsafe, emergency braking
+            return self.max_decel
+            
+        # Calculate maximum allowed acceleration
+        max_safe_accel = (h + rel_vel * self.dt) / (self.T_h * self.dt)
+        
+        # Apply constraint
+        safe_action = min(action, max_safe_accel)
+        return np.clip(safe_action, self.max_decel, self.max_accel)
+    
+    def set_test_mode(self, enabled=True):
+        self.test_mode = enabled
+        
+    def render(self):
+        if self.fig is None:
+            self.fig, self.axs = plt.subplots(2, 2, figsize=(12, 8))
+            plt.ion()
+            
+        rel_dist = self.lead_pos - self.ego_pos
+        
+        self.axs[0,0].clear()
+        self.axs[0,0].plot(self.ego_pos, 0, 'bo', markersize=10, label='Ego')
+        self.axs[0,0].plot(self.lead_pos, 0, 'ro', markersize=10, label='Lead')
+        self.axs[0,0].set_xlim(max(0, self.ego_pos-10), self.lead_pos+10)
+        self.axs[0,0].set_title('Vehicle Positions')
+        self.axs[0,0].legend()
+        
+        self.axs[0,1].clear()
+        self.axs[0,1].plot(self.current_step, self.ego_vel, 'bo', label='Ego')
+        self.axs[0,1].plot(self.current_step, self.lead_vel, 'ro', label='Lead')
+        self.axs[0,1].set_title('Velocities')
+        self.axs[0,1].set_ylabel('Speed (m/s)')
+        self.axs[0,1].legend()
+        
+        self.axs[1,0].clear()
+        self.axs[1,0].plot(self.current_step, rel_dist, 'go', label='Distance')
+        safe_dist = self.d0 + self.T_h * self.ego_vel
+        self.axs[1,0].axhline(y=safe_dist, color='r', linestyle='--', label='Safe Distance')
+        self.axs[1,0].set_title('Relative Distance')
+        self.axs[1,0].set_ylabel('Distance (m)')
+        self.axs[1,0].legend()
+        
+        self.axs[1,1].clear()
+        self.axs[1,1].plot(self.current_step, self.ego_vel - self.lead_vel, 'purple', label='Rel Velocity')
+        self.axs[1,1].set_title('Relative Velocity')
+        self.axs[1,1].set_ylabel('Velocity Diff (m/s)')
+        self.axs[1,1].legend()
+        
+        plt.tight_layout()
+        plt.pause(0.01)
+        
+        return None
+    
+    def close(self):
+        if self.fig is not None:
+            plt.close(self.fig)
+            self.fig = None
+            self.axs = None
 
