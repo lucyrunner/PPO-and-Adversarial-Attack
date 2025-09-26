@@ -3,7 +3,7 @@ from __future__ import annotations
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[55]:
+# In[82]:
 
 
 # One-cell train + save + smoke-check for ACCEnv + PPO (robust reset/step handling)
@@ -60,14 +60,20 @@ PPO_PARAMS = dict(
 )
 
 # 4) Env factory
-def make_env(seed=0, brake_profile=True, normalize_obs=True):
+# NOTE:
+# - Do NOT pass brake_profile (ACCEnv has no such arg).
+# - Keep normalize_obs=False; let VecNormalize handle normalization.
+def make_env(seed=0, normalize_obs=False):
     def _thunk():
-        return ACCEnv(brake_profile=brake_profile, normalize_obs=normalize_obs, seed=seed)
+        env = ACCEnv(normalize_obs=normalize_obs, seed=seed)
+        return env
     return _thunk
 
 # 5) Create vectorized normalized training env
-base_env = DummyVecEnv([make_env(seed=SEED, brake_profile=False, normalize_obs=True) for _ in range(N_ENVS)])
-train_env = VecNormalize(base_env, norm_obs=True, norm_reward=True, clip_obs=1.0)
+# Use distinct seeds if N_ENVS > 1 to avoid identical instances
+base_env = DummyVecEnv([make_env(seed=SEED + i, normalize_obs=False) for i in range(N_ENVS)])
+# Use a sane clip range; 10.0 is SB3 default. 1.0 over-clips and can hide attack effects.
+train_env = VecNormalize(base_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 print("Train env created. obs_space:", train_env.observation_space, "act_space:", train_env.action_space)
 
 # 6) Create model, set logger, train
@@ -107,7 +113,7 @@ def step_unwrap(env, action):
         raise RuntimeError(f"Unexpected env.step() return length: {len(out)}")
 
 # Build an evaluation env that uses the saved normalization stats
-eval_base = DummyVecEnv([make_env(seed=123, brake_profile=True, normalize_obs=True)])
+eval_base = DummyVecEnv([make_env(seed=123, normalize_obs=False)])
 eval_env = VecNormalize.load(vec_path, eval_base)
 eval_env.training = False
 eval_env.norm_reward = False
@@ -126,6 +132,7 @@ def run_eval_episode(mdl, env, max_steps=1000):
         obs, r, term, trunc, info = step_unwrap(env, action)
         total_r += float(r[0]) if hasattr(r, "__len__") else float(r)
         steps += 1
+        # info can be list[dict] for VecEnv
         idict = info if isinstance(info, dict) else (info[0] if hasattr(info, "__len__") and len(info) else {})
         if idict.get("collision", False):
             collided = True
@@ -160,7 +167,7 @@ print(" -", vec_path)
 print("These artifacts will be loaded by your attacks notebook.")
 
 
-# In[56]:
+# In[83]:
 
 
 # === Make model/env ready for the demo ===
@@ -185,20 +192,36 @@ except ModuleNotFoundError:
         # ACCEnv should now be in globals
 
 
-# In[57]:
+# In[84]:
 
 
 # 2) Try to load saved PPO + VecNormalize; otherwise quick-train a small model
+import os
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-LOGDIR = "runs/ppo_baseline"  # change if you saved elsewhere
+LOGDIR = "runs/ppo_baseline"          # change if you saved elsewhere
 vec_path = os.path.join(LOGDIR, "vecnormalize.pkl")
 mdl_path = os.path.join(LOGDIR, "ppo_acc.zip")
 
-def make_env(seed=123, brake_profile=True, normalize_obs=True):
+def make_env(seed=123, with_braking=True, normalize_obs=False):
+    """
+    Factory returning a fresh ACCEnv instance.
+    - normalize_obs=False so VecNormalize handles scaling (recommended with SB3).
+    - If with_braking=True, attach a simple lead-vehicle braking profile via attribute.
+      NOTE: Ensure ACCEnv.step() uses:
+            lead_acc = float(self.lead_profile(self.current_step)) if hasattr(self, "lead_profile") else 0.0
+            self.v_lead = float(np.clip(self.v_lead + lead_acc * DT, 0.0, 100.0))
+            self.x_lead = float(self.x_lead + self.v_lead * DT + 0.5 * lead_acc * DT * DT)
+    """
     def _thunk():
-        return ACCEnv(brake_profile=brake_profile, normalize_obs=normalize_obs, seed=seed)
+        env = ACCEnv(normalize_obs=normalize_obs, seed=seed)
+        if with_braking:
+            def lead_profile(step):
+                # mild braking between steps ~120–180; tweak as needed
+                return -2.5 if 120 <= step <= 180 else 0.0
+            env.lead_profile = lead_profile
+        return env
     return _thunk
 
 model = None
@@ -206,36 +229,45 @@ env = None
 
 if os.path.exists(vec_path) and os.path.exists(mdl_path):
     print(f"Loading saved model/env from {LOGDIR} ...")
-    base_env = DummyVecEnv([make_env(seed=123, brake_profile=True, normalize_obs=True)])
+    # Build a base env (raw obs) and load VecNormalize stats onto it
+    base_env = DummyVecEnv([make_env(seed=123, with_braking=True, normalize_obs=False)])
     env = VecNormalize.load(vec_path, base_env)
     env.training = False
     env.norm_reward = False
+
+    # Load PPO with the normalized eval env
     model = PPO.load(mdl_path, env=env)
     print("Loaded saved PPO and VecNormalize.")
 else:
-    print("Saved files not found; doing a quick in-memory train so the demo can run...")
-    # quick train on a stationary-lead scenario (no braking) so it learns *something*
-    train_env = DummyVecEnv([make_env(seed=42, brake_profile=False, normalize_obs=True)])
-    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=True, clip_obs=1.0)
+    print("Saved files not found; quick-training a small model so the demo can run...")
+
+    # ---- Train (no braking) ----
+    train_base = DummyVecEnv([make_env(seed=42, with_braking=False, normalize_obs=False)])
+    # Let VecNormalize handle observation scaling; use a generous clip (default 10.0)
+    train_env = VecNormalize(train_base, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
     model = PPO(
         "MlpPolicy", train_env, seed=42, verbose=0,
         n_steps=512, batch_size=128, learning_rate=3e-4,
         gamma=0.99, gae_lambda=0.95, clip_range=0.2, ent_coef=0.0
     )
-    model.learn(total_timesteps=8_000)  # small, fast
-    # build an eval env (with braking enabled) sharing the same VecNormalize statistics
-    eval_base = DummyVecEnv([make_env(seed=123, brake_profile=True, normalize_obs=True)])
-    env = VecNormalize(eval_base, norm_obs=True, norm_reward=False, clip_obs=1.0)
-    # copy normalization stats from training env so obs scales match what policy expects
+    model.learn(total_timesteps=8_000)  # quick smoke-train
+
+    # ---- Eval env (with braking) sharing the same normalization stats ----
+    eval_base = DummyVecEnv([make_env(seed=123, with_braking=True, normalize_obs=False)])
+    env = VecNormalize(eval_base, norm_obs=True, norm_reward=False, clip_obs=10.0)
+    # Copy normalization statistics from training env so observations match what the policy expects
     env.obs_rms = train_env.obs_rms
     env.ret_rms = train_env.ret_rms
     env.training = False
+
     print("Quick train done; model/env are ready.")
 
 print("\n✅ model and env are ready in this kernel.")
 
 
-# In[58]:
+
+# In[85]:
 
 
 import gymnasium as gym
@@ -244,241 +276,199 @@ import numpy as np
 from typing import Any
 
 
-# In[59]:
+# In[86]:
 
 
-def _to_tensor(x: np.ndarray) -> torch.Tensor:
-    return torch.as_tensor(x, dtype=torch.float32)
-
-
-# In[60]:
-
-
-class AttackWrapper:
-    """Base wrapper that perturbs observations before the agent acts."""
-    def __init__(self, model: Any, epsilon: float = 0.01, device: str = "cpu") -> None:
-        self.model = model
-        self.eps = float(epsilon)
-        self.device = device
-
-    def perturb(self, obs: np.ndarray) -> np.ndarray:
-        return obs
-
-    def act(self, obs: np.ndarray):
-        # Compute adversarial observation (gradients enabled in perturb),
-        # then call model.predict without gradients.
-        obs_adv = self.perturb(obs)
-        with torch.no_grad():
-            action, _ = self.model.predict(obs_adv, deterministic=True)
-        return action, obs_adv
-
-
-# In[61]:
-
-
-class FGSMAttack(AttackWrapper):
-    """FGSM with respect to policy mean action (pre-squash)."""
-    def perturb(self, obs: np.ndarray) -> np.ndarray:
-        # prepare policy for gradients
-        self.model.policy.set_training_mode(True)
-        self.model.policy.zero_grad(set_to_none=True)
-
-        obs_t = _to_tensor(obs)
-        single = False
-        if obs_t.ndim == 1:
-            obs_t = obs_t.unsqueeze(0)
-            single = True
-        obs_t = obs_t.to(self.device)
-        obs_t.requires_grad_(True)
-
-        # forward through policy internals to get mean action
-        features = self.model.policy.extract_features(obs_t)
-        latent_pi, _ = self.model.policy.mlp_extractor(features)
-        mean_actions = self.model.policy.action_net(latent_pi)  # [B, act_dim]
-
-        # simple scalar objective: increase squared mean action
-        obj = (mean_actions ** 2).sum()
-        obj.backward()
-
-        grad_sign = torch.sign(obs_t.grad)
-        adv = torch.clamp(obs_t + self.eps * grad_sign, -1.0, 1.0)
-        adv_np = adv.detach().cpu().numpy()
-        return adv_np[0] if single else adv_np
-
-
-# In[62]:
-
-
-class OIAttack(AttackWrapper):
-    """Optimism Induction Attack: increase the critic value V(s)."""
-    def perturb(self, obs: np.ndarray) -> np.ndarray:
-        self.model.policy.set_training_mode(True)
-        self.model.policy.zero_grad(set_to_none=True)
-
-        obs_t = _to_tensor(obs)
-        single = False
-        if obs_t.ndim == 1:
-            obs_t = obs_t.unsqueeze(0)
-            single = True
-        obs_t = obs_t.to(self.device)
-        obs_t.requires_grad_(True)
-
-        features = self.model.policy.extract_features(obs_t)
-        _, latent_vf = self.model.policy.mlp_extractor(features)
-        values = self.model.policy.value_net(latent_vf)  # [B,1]
-
-        obj = values.sum()
-        obj.backward()
-
-        grad_sign = torch.sign(obs_t.grad)
-        adv = torch.clamp(obs_t + self.eps * grad_sign, -1.0, 1.0)
-        adv_np = adv.detach().cpu().numpy()
-        return adv_np[0] if single else adv_np
-
-
-# In[63]:
-
-
-def print_attack_sanity(model, env, eps=0.01):
-    atk = FGSMAttack(model, epsilon=eps, device="cpu")
-    obs = env.reset()[0]
-    adv = atk.perturb(obs)
-    print("FGSM sanity:")
-    print(" original obs:", obs)
-    print(" adv obs     :", adv)
-    print(" max |Δ|     :", float(np.max(np.abs(np.array(adv) - np.array(obs)))))
-
-    atk2 = OIAttack(model, epsilon=eps, device="cpu")
-    adv2 = atk2.perturb(obs)
-    print("\nOIA sanity:")
-    print(" original obs:", obs)
-    print(" adv obs     :", adv2)
-    print(" max |Δ|     :", float(np.max(np.abs(np.array(adv2) - np.array(obs)))))
-
-
-# In[64]:
-
-
-print_attack_sanity(model, env, eps=0.02)
-
-
-# In[65]:
-
-
-# Requires: a loaded PPO `model` bound to an ACCEnv(normalize_obs=True) `env`
-try:
-    obs = env.reset()[0] if isinstance(env.reset(), tuple) else env.reset()
-except Exception:
-    print("Load/define `model` and `env` (ACCEnv with normalize_obs=True) first.")
-else:
-    fgsm = FGSMAttack(model, epsilon=0.01)
-    oia  = OIAttack(model,  epsilon=0.02)
-
-    adv_f = fgsm.perturb(obs)
-    adv_o = oia.perturb(obs)
-
-    print("FGSM max |Δ|:", float(np.max(np.abs(adv_f - obs))))
-    print("OIA  max |Δ|:", float(np.max(np.abs(adv_o - obs))))
-
-    # If you want to see an actual collision tendency right here:
-    env.unwrapped.set_safety_obs_for_filter(adv_o)  # make safety use attacked obs
-    a_o, _ = model.predict(adv_o, deterministic=True)
-    _, _, term, trunc, info = env.step(a_o)
-    print("Step under OIA attacked obs — collision flag:", (info[0] if isinstance(info, list) else info).get("collision"))
-
-
-
-# In[66]:
-
-
-import torch
+#imports & setup for attacks
 import numpy as np
-import gymnasium as gym
+import torch
 
-class AttackWrapper(gym.Wrapper):
-    def __init__(self, env, model, epsilon=0.01):
-        super(AttackWrapper, self).__init__(env)
+# Choose device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def _to_obs_tensor(obs: np.ndarray) -> torch.Tensor:
+    """
+    Convert a single normalized observation (shape: (obs_dim,) or (1, obs_dim))
+    into a torch tensor with requires_grad=True, on DEVICE, batched as (1, obs_dim).
+    """
+    if isinstance(obs, np.ndarray):
+        t = torch.tensor(obs, dtype=torch.float32, device=DEVICE)
+    else:
+        t = torch.as_tensor(obs, dtype=torch.float32, device=DEVICE)
+    if t.ndim == 1:
+        t = t.unsqueeze(0)
+    t.requires_grad_(True)
+    return t
+
+def _clip_norm_obs(obs_adv: np.ndarray, low=-1.0, high=1.0) -> np.ndarray:
+    """Clip perturbed normalized obs back into valid range (VecNormalize space)."""
+    return np.clip(obs_adv, low, high, dtype=np.float32)
+
+def _sign_np(x: np.ndarray) -> np.ndarray:
+    """Stable sign for numpy arrays."""
+    s = np.zeros_like(x, dtype=np.float32)
+    s[x > 0] = 1.0
+    s[x < 0] = -1.0
+    return s
+
+
+# In[87]:
+
+
+def fgsm_attack(model, obs_norm: np.ndarray, epsilon: float = 0.01, clip_to_unit=True) -> np.ndarray:
+    """
+    FGSM: s' = s + ε * sign(∇_s μθ(s))
+    - model: SB3 PPO model (with .policy)
+    - obs_norm: SINGLE normalized observation that the policy consumes (VecNormalize output)
+    - epsilon: perturbation budget in normalized units
+    """
+    policy = model.policy
+    policy.eval()
+    policy.to(DEVICE)
+
+    obs_t = _to_obs_tensor(obs_norm)  # (1, obs_dim), requires_grad=True
+
+    # Get policy distribution and its mean action
+    dist = policy.get_distribution(obs_t)
+    # Many SB3 policies expose .distribution.mean for Gaussian policies
+    if hasattr(dist.distribution, "mean"):
+        act_mean = dist.distribution.mean   # shape (1, act_dim)
+        # To backprop to obs, reduce to scalar; sum across action dims
+        scalar = act_mean.sum()
+    else:
+        # Fallback: use the deterministic action as proxy (less ideal)
+        # This path should rarely be needed for standard MlpPolicy (Gaussian)
+        act = policy.predict(obs_t, deterministic=True)[0]
+        scalar = act.sum()
+
+    # Backprop
+    policy.zero_grad(set_to_none=True)
+    if obs_t.grad is not None:
+        obs_t.grad.zero_()
+    scalar.backward(retain_graph=False)
+
+    grad = obs_t.grad.detach().cpu().numpy().squeeze(0)  # (obs_dim,)
+    pert = epsilon * _sign_np(grad)
+    adv = (obs_norm + pert).astype(np.float32)
+
+    if clip_to_unit:
+        adv = _clip_norm_obs(adv, -1.0, 1.0)
+    return adv
+
+
+def oia_attack(model, obs_norm: np.ndarray, epsilon: float = 0.01, clip_to_unit=True) -> np.ndarray:
+    """
+    OIA: s' = s + ε * sign(∇_s Vϕ(s))
+    - model: SB3 PPO model (with .policy)
+    - obs_norm: SINGLE normalized observation (VecNormalize output)
+    - epsilon: perturbation budget in normalized units
+    """
+    policy = model.policy
+    policy.eval()
+    policy.to(DEVICE)
+
+    obs_t = _to_obs_tensor(obs_norm)  # (1, obs_dim), requires_grad=True
+
+    # Critic value forward pass
+    # SB3 PPO policies usually have .predict_values(obs) -> (batch, 1) tensor
+    if hasattr(policy, "predict_values"):
+        v = policy.predict_values(obs_t)
+    elif hasattr(policy, "forward_critic"):
+        v = policy.forward_critic(obs_t)
+    else:
+        # Fallback: try value_net directly (MlpPolicy exposes critic internally)
+        v = policy.value_net(policy.extract_features(obs_t))
+    v_scalar = v.sum()
+
+    # Backprop wrt obs
+    policy.zero_grad(set_to_none=True)
+    if obs_t.grad is not None:
+        obs_t.grad.zero_()
+    v_scalar.backward(retain_graph=False)
+
+    grad = obs_t.grad.detach().cpu().numpy().squeeze(0)  # (obs_dim,)
+    pert = epsilon * _sign_np(grad)
+    adv = (obs_norm + pert).astype(np.float32)
+
+    if clip_to_unit:
+        adv = _clip_norm_obs(adv, -1.0, 1.0)
+    return adv
+
+
+# In[88]:
+
+
+# Thin wrappers to match your eval loop signature attack_fn(obs, eps)
+
+class FGSMAttack:
+    """Callable wrapper: adv_obs = FGSMAttack(model)(obs_norm, eps)"""
+    def __init__(self, model, clip_to_unit=True):
         self.model = model
-        self.epsilon = epsilon
-        self.attack_name = "BaseAttack"
-        
-    def step(self, action):
-        return self.env.step(action)
-    
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
+        self.clip = clip_to_unit
 
-class FGSMAttackWrapper(AttackWrapper):
-    def __init__(self, env, model, epsilon=0.01):
-        super(FGSMAttackWrapper, self).__init__(env, model, epsilon)
-        self.attack_name = "FGSM"
-        
-    def step(self, action):
-        # Get current state for gradient computation
-        norm_state = self.env._get_obs()
-        
-        # Convert to tensor for gradient computation
-        state_tensor = torch.tensor(norm_state, dtype=torch.float32, requires_grad=True)
-        
-        # Compute gradient of action with respect to state
-        action_tensor, _ = self.model.policy(state_tensor.unsqueeze(0))
-        action_tensor.mean().backward()
-        
-        if state_tensor.grad is not None:
-            gradient = state_tensor.grad.numpy()
-            perturbation = self.epsilon * np.sign(gradient)
-            
-            # Apply perturbation to normalized state
-            perturbed_norm_state = norm_state + perturbation
-            perturbed_norm_state = np.clip(perturbed_norm_state, 0, 1)
-            
-            # Store perturbed state for observation
-            self.env.last_perturbed_state = perturbed_norm_state
-        else:
-            self.env.last_perturbed_state = norm_state
-            
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        return obs, reward, terminated, truncated, info
-    
-    def reset(self, **kwargs):
-        self.env.last_perturbed_state = None
-        obs, info = self.env.reset(**kwargs)
-        return obs, info
+    def __call__(self, obs_norm: np.ndarray, eps: float = 0.01) -> np.ndarray:
+        return fgsm_attack(self.model, obs_norm, epsilon=eps, clip_to_unit=self.clip)
 
-class OLAttackWrapper(AttackWrapper):
-    def __init__(self, env, model, epsilon=0.01):
-        super(OLAttackWrapper, self).__init__(env, model, epsilon)
-        self.attack_name = "OIA"
-        
-    def step(self, action):
-        # Get current state for gradient computation
-        norm_state = self.env._get_obs()
-        
-        # Convert to tensor for gradient computation
-        state_tensor = torch.tensor(norm_state, dtype=torch.float32, requires_grad=True)
-        
-        # Compute gradient of value function with respect to state
-        value = self.model.policy.value_net(state_tensor.unsqueeze(0))
-        value.backward()
-        
-        if state_tensor.grad is not None:
-            gradient = state_tensor.grad.numpy()
-            perturbation = self.epsilon * np.sign(gradient)
-            
-            # Apply perturbation to normalized state
-            perturbed_norm_state = norm_state + perturbation
-            perturbed_norm_state = np.clip(perturbed_norm_state, 0, 1)
-            
-            # Store perturbed state for observation
-            self.env.last_perturbed_state = perturbed_norm_state
-        else:
-            self.env.last_perturbed_state = norm_state
-            
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        return obs, reward, terminated, truncated, info
-    
-    def reset(self, **kwargs):
-        self.env.last_perturbed_state = None
-        obs, info = self.env.reset(**kwargs)
-        return obs, info
+
+class OIAttack:
+    """Callable wrapper: adv_obs = OIAttack(model)(obs_norm, eps)"""
+    def __init__(self, model, clip_to_unit=True):
+        self.model = model
+        self.clip = clip_to_unit
+
+    def __call__(self, obs_norm: np.ndarray, eps: float = 0.01) -> np.ndarray:
+        return oia_attack(self.model, obs_norm, epsilon=eps, clip_to_unit=self.clip)
+
+
+# Convenience functions (if you prefer function refs)
+def fgsm_fn(obs_norm: np.ndarray, eps: float, model=None) -> np.ndarray:
+    assert model is not None, "Pass model via functools.partial or switch to FGSMAttack class."
+    return fgsm_attack(model, obs_norm, epsilon=eps, clip_to_unit=True)
+
+def oia_fn(obs_norm: np.ndarray, eps: float, model=None) -> np.ndarray:
+    assert model is not None, "Pass model via functools.partial or switch to OIAttack class."
+    return oia_attack(model, obs_norm, epsilon=eps, clip_to_unit=True)
+
+
+# In[89]:
+
+
+# Cell D: quick sanity (requires a loaded SB3 PPO model and a normalized obs)
+# Example usage inside your evaluation notebook:
+#   fgsm = FGSMAttack(model)
+#   oia  = OIAttack(model)
+#   adv_obs_fgsm = fgsm(obs_norm, eps=0.02)
+#   adv_obs_oia  = oia(obs_norm,  eps=0.02)
+
+def _debug_grad_direction(model, obs_norm):
+    """Utility to verify both grads are non-zero and distinct."""
+    with torch.no_grad():
+        pass  # ensure no lingering graph
+
+    # FGSM grad dir
+    obs_t = _to_obs_tensor(obs_norm)
+    dist = model.policy.get_distribution(obs_t)
+    m = dist.distribution.mean
+    model.policy.zero_grad(set_to_none=True)
+    if obs_t.grad is not None: obs_t.grad.zero_()
+    m.sum().backward()
+    g_fgsm = obs_t.grad.detach().cpu().numpy().squeeze(0)
+
+    # OIA grad dir
+    obs_t2 = _to_obs_tensor(obs_norm)
+    if hasattr(model.policy, "predict_values"):
+        v = model.policy.predict_values(obs_t2)
+    else:
+        v = model.policy.forward_critic(obs_t2)
+    model.policy.zero_grad(set_to_none=True)
+    if obs_t2.grad is not None: obs_t2.grad.zero_()
+    v.sum().backward()
+    g_oia = obs_t2.grad.detach().cpu().numpy().squeeze(0)
+
+    return g_fgsm, g_oia
+
+# Example (commented):
+# test_obs = np.zeros((3,), dtype=np.float32)  # replace with a real normalized obs
+# gf, go = _debug_grad_direction(model, test_obs)
+# print("FGSM grad L1:", np.abs(gf).sum(), "OIA grad L1:", np.abs(go).sum())
 
